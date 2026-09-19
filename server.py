@@ -191,6 +191,36 @@ def _parse_message(msg) -> dict:
     return result
 
 
+def _check_uid(uid: str) -> str:
+    """Only a single numeric UID is allowed, so IMAP sets like '1:*' never reach FETCH/STORE."""
+    if not uid.isdigit():
+        raise ValueError(f"Invalid uid '{uid}': must be a single numeric IMAP UID")
+    return uid
+
+
+def _fetch(conn: imaplib.IMAP4_SSL, uid) -> Optional[Any]:
+    """Fetch one message by IMAP UID. Returns None if that UID no longer exists."""
+    status, msg_data = conn.uid("fetch", uid, "(RFC822)")
+    if status != "OK" or not msg_data or not isinstance(msg_data[0], tuple):
+        return None
+    return email.message_from_bytes(msg_data[0][1])
+
+
+def _summaries(conn: imaplib.IMAP4_SSL, data: list, limit: int) -> list:
+    """Newest-first list view from a UID SEARCH response, body truncated."""
+    results = []
+    for uid in reversed((data[0] or b"").split()[-limit:]):
+        msg = _fetch(conn, uid)
+        if msg is None:
+            continue
+        parsed = _parse_message(msg)
+        parsed["uid"] = uid.decode()
+        if len(parsed["body"]) > 200:
+            parsed["body"] = parsed["body"][:200] + "..."
+        results.append(parsed)
+    return results
+
+
 # ═══════════════════════════════════════════════════════
 #  工具
 # ═══════════════════════════════════════════════════════
@@ -229,33 +259,11 @@ def email_get_messages(account: str = "", mailbox: str = "INBOX", limit: int = 1
     conn = _connect_imap(acc)
     try:
         _select(conn, mailbox, readonly=True)
-        status, data = conn.search(None, "ALL")
+        status, data = conn.uid("search", None, "ALL")
         if status != "OK":
             return []
 
-        msg_ids = data[0].split()
-        if not msg_ids:
-            return []
-
-        # Get latest messages
-        msg_ids = msg_ids[-limit:]
-        msg_ids.reverse()
-
-        results = []
-        for msg_id in msg_ids:
-            status, msg_data = conn.fetch(msg_id, "(RFC822)")
-            if status != "OK":
-                continue
-            raw = msg_data[0][1]
-            msg = email.message_from_bytes(raw)
-            parsed = _parse_message(msg)
-            parsed["uid"] = msg_id.decode()
-            # Truncate body for list view
-            if len(parsed["body"]) > 200:
-                parsed["body"] = parsed["body"][:200] + "..."
-            results.append(parsed)
-
-        return results
+        return _summaries(conn, data, limit)
     finally:
         conn.logout()
 
@@ -267,11 +275,9 @@ def email_get_message(uid: str, account: str = "", mailbox: str = "INBOX") -> di
     conn = _connect_imap(acc)
     try:
         _select(conn, mailbox, readonly=True)
-        status, msg_data = conn.fetch(uid.encode(), "(RFC822)")
-        if status != "OK":
-            return {"error": f"Failed to fetch message {uid}"}
-        raw = msg_data[0][1]
-        msg = email.message_from_bytes(raw)
+        msg = _fetch(conn, _check_uid(uid))
+        if msg is None:
+            return {"error": f"Message {uid} not found in '{mailbox}'"}
         parsed = _parse_message(msg)
         parsed["uid"] = uid
         return parsed
@@ -286,31 +292,11 @@ def email_get_unread(account: str = "", mailbox: str = "INBOX", limit: int = 20)
     conn = _connect_imap(acc)
     try:
         _select(conn, mailbox, readonly=True)
-        status, data = conn.search(None, "UNSEEN")
+        status, data = conn.uid("search", None, "UNSEEN")
         if status != "OK":
             return []
 
-        msg_ids = data[0].split()
-        if not msg_ids:
-            return []
-
-        msg_ids = msg_ids[-limit:]
-        msg_ids.reverse()
-
-        results = []
-        for msg_id in msg_ids:
-            status, msg_data = conn.fetch(msg_id, "(RFC822)")
-            if status != "OK":
-                continue
-            raw = msg_data[0][1]
-            msg = email.message_from_bytes(raw)
-            parsed = _parse_message(msg)
-            parsed["uid"] = msg_id.decode()
-            if len(parsed["body"]) > 200:
-                parsed["body"] = parsed["body"][:200] + "..."
-            results.append(parsed)
-
-        return results
+        return _summaries(conn, data, limit)
     finally:
         conn.logout()
 
@@ -362,11 +348,9 @@ def email_reply(uid: str, body: str, account: str = "", mailbox: str = "INBOX", 
     conn = _connect_imap(acc)
     try:
         _select(conn, mailbox, readonly=True)
-        status, msg_data = conn.fetch(uid.encode(), "(RFC822)")
-        if status != "OK":
-            return {"error": f"Failed to fetch message {uid}"}
-        raw = msg_data[0][1]
-        original = email.message_from_bytes(raw)
+        original = _fetch(conn, _check_uid(uid))
+        if original is None:
+            return {"error": f"Message {uid} not found in '{mailbox}'"}
     finally:
         conn.logout()
 
@@ -435,35 +419,16 @@ def email_search(query: str, account: str = "", mailbox: str = "INBOX", limit: i
     try:
         _select(conn, mailbox, readonly=True)
         # Try UTF-8 search first, fall back to ASCII
+        # (bytes on purpose: imaplib encodes str args as ASCII, which breaks non-ASCII queries)
         try:
-            status, data = conn.search("UTF-8", query)
+            status, data = conn.uid("search", "CHARSET", "UTF-8", query.encode("utf-8"))
         except Exception:
-            status, data = conn.search(None, query)
+            status, data = conn.uid("search", None, query)
 
         if status != "OK":
             return []
 
-        msg_ids = data[0].split()
-        if not msg_ids:
-            return []
-
-        msg_ids = msg_ids[-limit:]
-        msg_ids.reverse()
-
-        results = []
-        for msg_id in msg_ids:
-            status, msg_data = conn.fetch(msg_id, "(RFC822)")
-            if status != "OK":
-                continue
-            raw = msg_data[0][1]
-            msg = email.message_from_bytes(raw)
-            parsed = _parse_message(msg)
-            parsed["uid"] = msg_id.decode()
-            if len(parsed["body"]) > 200:
-                parsed["body"] = parsed["body"][:200] + "..."
-            results.append(parsed)
-
-        return results
+        return _summaries(conn, data, limit)
     finally:
         conn.logout()
 
@@ -475,7 +440,7 @@ def email_delete(uid: str, account: str = "", mailbox: str = "INBOX") -> dict:
     conn = _connect_imap(acc)
     try:
         _select(conn, mailbox)
-        conn.store(uid.encode(), "+FLAGS", "\\Deleted")
+        conn.uid("store", _check_uid(uid), "+FLAGS", "\\Deleted")
         conn.expunge()
         return {"success": True, "deleted_uid": uid}
     finally:
@@ -489,7 +454,7 @@ def email_mark_read(uid: str, account: str = "", mailbox: str = "INBOX") -> dict
     conn = _connect_imap(acc)
     try:
         _select(conn, mailbox)
-        conn.store(uid.encode(), "+FLAGS", "\\Seen")
+        conn.uid("store", _check_uid(uid), "+FLAGS", "\\Seen")
         return {"success": True, "uid": uid}
     finally:
         conn.logout()
